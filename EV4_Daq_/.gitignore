@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Local CAN logs
+can_logs/
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
