@@ -30,6 +30,19 @@ EV4_Daq_/
 > so it is public. **Regenerate it** and only ever put the new one in `.env`
 > (which is git-ignored). Never paste a token into a `.py` file.
 
+
+!! DO NOT CHANGE !!
+Token: export INFLUXDB_TOKEN=tzawJ3TXv2XWvlO2OLduRr_SaBzfmcZZxJXgNQkADNibxt8iwJv5vtnGS0gc9A4UBEPAYjZSBgAQ2Mdtb7MZpQ==
+
+!! Setup for PI !!
+import os, time
+from influxdb_client_3 import InfluxDBClient3, Point
+
+token = os.environ.get("INFLUXDB_TOKEN")
+org = "EV 4"
+host = "https://us-east-1-1.aws.cloud2.influxdata.com"
+
+client = InfluxDBClient3(host=host, token=token, org=org)
 ---
 
 ## 2. One-time Raspberry Pi setup
