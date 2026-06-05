@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-EV4 DAQ - Live CAN -> InfluxDB logger.
+EV4 DAQ - Live CAN -> InfluxDB v3 logger.
 
 Reads CAN frames from a socketcan interface (e.g. can0) on the Raspberry Pi,
 decodes them with the DBC files in ./DBC, writes every decoded signal to an
-InfluxDB Cloud bucket in real time, and keeps a local CSV backup of every raw
-frame so nothing is lost if the network drops.
+InfluxDB Cloud v3 database in real time, and keeps a local CSV backup of every
+raw frame so nothing is lost if the network drops.
 
-Config comes from a .env file (see .env.example). Run with:
+Uses the InfluxDB 3 client (influxdb3-python / InfluxDBClient3). Config comes
+from a .env file (see .env.example). Run with:
     python3 can_to_influx.py
 Stop with Ctrl+C.
 """
@@ -23,18 +24,18 @@ from datetime import datetime, timezone
 import can
 import cantools
 from dotenv import load_dotenv
-from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import WriteOptions
+from influxdb_client_3 import InfluxDBClient3, Point, write_client_options
+from influxdb_client_3.write_client.client.write_api import WriteOptions, WriteType
 
 # ---------------------------------------------------------------------------
 # Configuration (from .env)
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-INFLUX_URL = os.getenv("INFLUX_URL", "https://us-east-1-1.aws.cloud2.influxdata.com")
+INFLUX_HOST = os.getenv("INFLUX_HOST", "https://us-east-1-1.aws.cloud2.influxdata.com")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
-INFLUX_ORG = os.getenv("INFLUX_ORG", "university_of_cincinnati")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "ev4_can_data")
+INFLUX_ORG = os.getenv("INFLUX_ORG", "EV 4")
+INFLUX_DATABASE = os.getenv("INFLUX_DATABASE", "ev4_can_data")
 
 CAN_CHANNEL = os.getenv("CAN_CHANNEL", "can0")
 CAN_INTERFACE = os.getenv("CAN_INTERFACE", "socketcan")  # "socketcan" on the Pi
@@ -107,33 +108,56 @@ def setup_bus() -> can.BusABC:
         sys.exit(1)
 
 
-def make_influx_writer():
-    """Return (client, write_api) using the batching (async) write API."""
+# Batching write callbacks. With the batching write API, writes are queued and
+# flushed on a background thread, so success/failure is reported here (errors
+# from a bad token/database/network show up via error_cb a few seconds after
+# the first write).
+def _success_cb(conf, data):
+    logger.debug("InfluxDB batch write OK (%d bytes).", len(data))
+
+
+def _error_cb(conf, data, exception):
+    logger.error("InfluxDB write failed: %s", exception)
+
+
+def _retry_cb(conf, data, exception):
+    logger.warning("Retrying InfluxDB write after error: %s", exception)
+
+
+def make_influx_client() -> InfluxDBClient3:
+    """Create the InfluxDB v3 client with batching enabled."""
     if not INFLUX_TOKEN:
         logger.error("INFLUX_TOKEN is not set. Copy .env.example to .env and fill it in.")
         sys.exit(1)
 
-    client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-    # Batching write API: points are queued and flushed on a background thread,
-    # with automatic retries if the upload fails (e.g. brief network loss).
-    write_api = client.write_api(
-        write_options=WriteOptions(
-            batch_size=500,
-            flush_interval=2_000,    # ms
-            jitter_interval=500,
-            retry_interval=5_000,
-            max_retries=5,
-            max_retry_delay=30_000,
-            exponential_base=2,
-        )
+    write_options = WriteOptions(
+        batch_size=500,
+        flush_interval=2_000,    # ms
+        jitter_interval=500,
+        retry_interval=5_000,
+        max_retries=5,
+        max_retry_delay=30_000,
+        exponential_base=2,
+        write_type=WriteType.batching,
+    )
+    wco = write_client_options(
+        success_callback=_success_cb,
+        error_callback=_error_cb,
+        retry_callback=_retry_cb,
+        write_options=write_options,
     )
 
-    # Fail fast if we can't reach InfluxDB / auth is wrong.
-    if not client.ping():
-        logger.error("Could not reach InfluxDB at %s. Check URL/token/network.", INFLUX_URL)
-        sys.exit(1)
-    logger.info("Connected to InfluxDB, writing to bucket '%s'.", INFLUX_BUCKET)
-    return client, write_api
+    client = InfluxDBClient3(
+        host=INFLUX_HOST,
+        token=INFLUX_TOKEN,
+        org=INFLUX_ORG,
+        database=INFLUX_DATABASE,
+        write_client_options=wco,
+    )
+    logger.info("InfluxDB v3 client ready -> database '%s' on %s",
+                INFLUX_DATABASE, INFLUX_HOST)
+    logger.info("(Write errors, if any, appear a few seconds after the first message.)")
+    return client
 
 
 def build_point(message, decoded: dict, raw_id: int, ts_unix: float) -> Point | None:
@@ -159,8 +183,9 @@ def build_point(message, decoded: dict, raw_id: int, ts_unix: float) -> Point | 
     if not has_field:
         return None
 
-    # Use the kernel hardware timestamp from socketcan for accuracy.
-    point = point.time(int(ts_unix * 1e9), WritePrecision.NS)
+    # Use the kernel hardware timestamp from socketcan. A tz-aware datetime is
+    # serialized to nanosecond-precision line protocol by the client.
+    point = point.time(datetime.fromtimestamp(ts_unix, tz=timezone.utc))
     return point
 
 
@@ -170,7 +195,7 @@ def main():
 
     db = load_dbc()
     bus = setup_bus()
-    client, write_api = make_influx_writer()
+    client = make_influx_client()
 
     LOG_DIR.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -223,22 +248,21 @@ def main():
                 if message and decoded:
                     point = build_point(message, decoded, msg.arbitration_id, ts_unix)
                     if point is not None:
-                        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+                        client.write(record=point)
                         decoded_count += 1
                         if decoded_count % 500 == 0:
-                            logger.info("Uploaded %d decoded messages so far...", decoded_count)
+                            logger.info("Queued %d decoded messages so far...", decoded_count)
 
     except Exception as e:
         logger.error("Fatal error in main loop: %s", e)
     finally:
         logger.info("Flushing remaining InfluxDB writes...")
         try:
-            write_api.close()
-            client.close()
-        except Exception:
-            pass
+            client.close()  # flushes any queued batches
+        except Exception as e:
+            logger.error("Error closing InfluxDB client: %s", e)
         bus.shutdown()
-        logger.info("Done. %d messages uploaded. Unknown IDs seen: %d.",
+        logger.info("Done. %d messages queued for upload. Unknown IDs seen: %d.",
                     decoded_count, len(unknown_ids))
 
 
